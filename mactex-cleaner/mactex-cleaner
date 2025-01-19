@@ -1,0 +1,267 @@
+#!/bin/bash
+#
+# mactex-cleaner - A little third-party uninstaller and cleanup tool for MacTeX
+#
+# DESCRIPTION
+#
+# This is mostly about being able to uninstall the Ghostscript that is installed by the
+# MacTeX installer.
+#
+# This is a work in progress, and is not complete or robust. Use at your own risk.
+#
+# SYNOPSIS
+#
+#   mactex-cleaner <subcmd> [...options...]
+#
+# Subcommands:
+#
+# rm-all-gs - Removes all Ghostscripts that look like they were installed by MacTeX,
+# including the whole /usr/local/share/ghostscript directory. This will also remove any
+# non-MacTeX-installed Ghostscripts that went to the same place.
+#
+# list - List MacTeX-installed packages on this system, according to the pkgutil databse.
+#
+# probe - List MacTeX-installed packages, and check if their files are present.
+#
+# NOTES
+#
+# This assumes everything is on the main / volume.
+#
+# You probably need to run this with sudo
+
+
+# ===== Generic boilerplate and utilities =====
+
+set -o errexit
+set -o nounset
+set -o pipefail
+if [[ "${TRACE:-0}" == "1" ]]; then set -o xtrace; fi
+
+readonly THIS_PROGRAM="$(basename "$0")"
+DRY_RUN=0
+VERBOSE=0
+
+function now()     { echo $(date +'%Y-%m-%d %H:%M:%S'); }
+function timenow() { echo $(date +'%H:%M:%S'); }
+function info()    { emit "$*"; }
+function verbose() { if is_verbose; then info "$@"; fi; }
+function warning() { info "WARNING: $*"; }
+function error()   { info "ERROR: $*"; }
+function emit()    { echo >&2 "${THIS_PROGRAM:-???}: $*"; }
+# function emit()    { echo >&2 "${THIS_PROGRAM:-???}: $(timenow): $*"; }
+function die()     { error "$@"; exit 1; }
+function dry()     { info "dry-run: would:" "$@"; }
+function dry_vrb() { verbose "dry-run: would:" "$@"; }
+function wet() {
+  # Run a command only if this is not a dry run, or just print it if this is a dry run.
+  if is_dry_run; then dry_vrb "$@"; else verbose 'running:' "$@"; "$@"; return $?; fi;
+}
+function is_dry_run() { if [[ "${DRY_RUN:-0}" != 0 ]]; then return 0; else return 1; fi; }
+function is_wet_run() { if [[ "${DRY_RUN:-0}" == 0 ]]; then return 0; else return 1; fi; }
+function is_verbose() { if [[ "${VERBOSE:-0}" != 0 ]]; then return 0; else return 1; fi; }
+function forbid_dry_run() {
+  if is_dry_run; then
+    die "dry-run is not implemented for this functionality yet. Aborted."
+  fi
+}
+
+
+# ===== Script-specific code =====
+
+SUBCMD=''
+DEBUG_SIM_FAIL_RM=0
+
+function parse_cmdline() {
+  local arg
+
+  while [[ $# -ge 1 ]]; do
+    arg="$1"; shift
+    case "$arg" in
+      -v | --verbose) VERBOSE=1 ;;
+      --dry-run)      DRY_RUN=1 ;;
+      --debug-sim-fail-rm)
+        # Simulate failure of removing installed files
+        DEBUG_SIM_FAIL_RM=1 ;;
+      *)
+        if [[ -z "$SUBCMD" ]]; then
+          SUBCMD="$arg"
+        else
+          die "Unexpected argument: ${arg}"
+        fi ;;
+    esac
+  done
+
+  readonly DRY_RUN VERBOSE SUBCMD
+}
+
+function rm_file() {
+  local file="$1"
+  if [[ $DEBUG_SIM_FAIL_RM == 1 ]]; then
+    verbose "debug: sim fail for: rm {$file}"
+    return 1
+  else
+    # Is there a terser way to do this?
+    if rm -f "$file"; then return 0; else return $?; fi
+  fi
+}
+
+function uninstall_pkg() {
+  # Uninstall a package (clumsily)
+  #
+  #   Args: pkg
+  local pkg="$1"
+  local rel_file file n_files n_del n_fail_del n_missing retval
+  local -a files
+
+  retval=0
+
+  info "Uninstalling package ${pkg}"
+  if ! pkgutil --pkg-info "$pkg" > /dev/null; then
+    info "Could not uninstall package ${pkg} because it does not appear to be installed."
+    return
+  fi
+
+  # Remove files
+
+  files=($(pkgutil --files "$pkg" --only-files))
+  n_files=${#files[@]}
+  n_del=0; n_fail_del=0; n_missing=0
+  info "Deleting ${n_files} files listed for package"
+  for rel_file in "${files[@]}"; do
+    # Assume installation under / volume
+    file="/${rel_file}"
+    if [[ -f "$file" ]]; then
+      if is_dry_run; then
+        dry_vrb "rm ${file}"
+        n_del=$(( n_del + 1 ))
+      else
+        if rm_file "$file"; then
+          n_del=$(( n_del + 1 ))
+        else
+          error "Failed deleting file: ${file}"
+          n_fail_del=$(( n_fail_del + 1 ))
+        fi
+      fi
+    else
+      # File is absent. Hopefully fine; just ignore it.
+      n_missing=$(( n_missing + 1 ))
+    fi
+  done
+  info "Deleted files: ${n_del} ok, ${n_fail_del} failed, ${n_missing} missing, of ${n_files} listed"
+
+  # Forget the package, which removes the record of its installation
+  #
+  # Only do the forgetting if file removal is successful, so that failed removals can be
+  # re-tried.
+  if [[ $n_fail_del == 0 ]]; then
+    if wet pkgutil --forget "$pkg"; then
+      info "Forgot package ${pkg}"
+    else
+      error "Failed forgetting package ${pkg}"
+      retval=1
+    fi
+  else
+    info "Failed deleting ${n_fail_del} files in package ${pkg}. Not forgetting the package."
+    retval=1
+  fi
+
+  return $retval
+}
+
+# List installed MacTeX packages
+function list_mactex_pkgs() {
+  pkgutil --pkgs='org\.tug\.mactex\..*' || true
+}
+
+function list_mactex_gs_pkags() {
+  pkgutil --pkgs='org\.tug\.mactex\.ghostscript.*' || true
+}
+
+function subcmd_rm_all_gs() {
+  local -a gs_pkgs
+  local n_pkgs pkg n_failed
+  local top_gs_share='/usr/local/share/ghostscript'
+  info "Removing all MacTeX-installed ghostscripts"
+
+  # Remove packages
+  gs_pkgs=($(list_mactex_gs_pkags))
+  n_pkgs=${#gs_pkgs[@]}
+  n_failed=0
+  if [[ $n_pkgs == 0 ]]; then
+    info "No installed MacTeX ghostscript packages found. No packages to remove."
+  else
+    info "Removing ${n_pkgs} installed MacTeX ghostscript packages: ${gs_pkgs[@]}"
+    for pkg in "${gs_pkgs[@]}"; do
+      if ! uninstall_pkg "$pkg"; then
+        n_failed=$(( n_failed + 1 ))
+      fi
+    done
+  fi
+
+  # Remove main share/ghostscript dir
+  if [[ $n_failed != 0 ]]; then
+    warning "Some package removals failed. Not removing main ${top_gs_share} dir"
+  elif [[ ! -d "$top_gs_share" ]]; then
+    info "Main ${top_gs_share} dir is absent or not a dir; not removing"
+  else
+    info "Removing main ${top_gs_share} dir"
+    if ! wet rm -rf "${top_gs_share}"; then
+      error "Failed removing main ${top_gs_share} dir"
+    fi
+  fi
+
+  info "Finished removing all MacTeX-installed ghostscripts. ${n_failed} failed."
+}
+
+function subcmd_list_pkgs() {
+  local -a pkgs
+  local pkg
+  list_mactex_pkgs
+  if is_verbose; then
+    echo ''
+    pkgs=($(list_mactex_pkgs))
+    for pkg in "${pkgs[@]}"; do
+      pkgutil --pkg-info "$pkg"
+      echo ''
+    done
+  fi
+}
+
+function subcmd_probe_pkgs() {
+  local -a pkgs files
+  local pkg n_pkgs file n_files n_here n_gone
+  pkgs=($(list_mactex_pkgs))
+  n_pkgs=${#pkgs[@]}
+  echo "Found ${n_pkgs} MacTeX-installed packages"
+  for pkg in "${pkgs[@]}"; do
+    files=($(pkgutil --files "$pkg" --only-files))
+    n_files="${#files[@]}"
+    n_here=0; n_gone=0
+    for file in "${files[@]}"; do
+      if [[ -f "/$file" ]]; then n_here=$((n_here+1)); else n_gone=$((n_gone+1)); fi
+    done
+    echo "${pkg}: files: ${n_files} listed, ${n_here} present, ${n_gone} missing" 
+  done
+}
+
+function main() {
+  local -a valid_subcmds
+  valid_subcmds=(rm-all-gs list probe)
+
+  if [[ -z "$SUBCMD" ]]; then
+    die "The <subcommand> argument is required."
+  fi
+  case "$SUBCMD" in
+    rm-all-gs)  subcmd_rm_all_gs ;;
+    list)       subcmd_list_pkgs ;;
+    probe)      subcmd_probe_pkgs ;;
+    *)
+      die "Invalid subcommand: ${SUBCMD}. Valid subcmds are: ${valid_subcmds}" ;;
+  esac
+}
+
+# Main script code
+
+parse_cmdline "$@"
+main
+
