@@ -130,3 +130,8 @@ org.tug.mactex.gui2023: files: 35749 listed, 2886 present, 32863 missing
 org.tug.mactex.texlive2024: files: 234139 listed, 229467 present, 4672 missing
 org.tug.mactex.gui2020: files: 2728 listed, 1435 present, 1293 missing
 ```
+
+### Downloads
+
+* Older MacTeX packages
+  * <https://ftp.math.utah.edu/pub/tex/historic/systems/mactex/2023/>
